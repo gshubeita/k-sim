@@ -1,0 +1,579 @@
+
+#cite the following paper when using this code: Chang, C. et al. "On the use of thermal forces to probe kinesin’s response to force", Frontiers in molecular biosceinces(2023) DOI: 10.3389/fmolb.2023.1260914
+# Contact the corresponsing author for any questions, or for an updated commented version of this code when available. 
+
+#import pcgmodule as pcg
+import numpy.random as r 
+import datetime
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+#from progressbar import *
+import os
+import csv
+from math import exp, sqrt
+from parameters_030521 import * 
+from shutil import copy
+import sys
+
+
+VERBOSE = False
+
+def detachment(F):
+
+	if superstall:
+		if -F > stall_force:
+			return zero_load_detachment_rate * (1.07 - 0.186*F) / 1000 
+
+	if detachmentModel == 'bl-m':
+		if F <= 0:
+			L = L_h
+			delta = delta_h
+
+		if F > 0:
+			L = L_a
+			delta = delta_a
+
+		return 1.0/((L*exp(-delta*abs(F)/kT)/step_length) + 1.0)
+	
+	if detachmentModel == 'bl-l':
+		if F <= 0:
+			L = L_h
+			delta = delta_h
+			return (1.0/((L*exp(-delta*abs(F)/kT)/step_length) + 1.0))
+
+		elif F > 2:
+			L = L_a
+			delta = delta_a
+			return (1.0/((L*exp(-delta*abs(F)/kT)/step_length) + 1.0))
+		
+		else:
+			return (0.00726821485552207 + 0.04488765127984973*F) # 0.00727 is p_det(F=0), 0.0449 is (p_det(2)-p_det(0)/(2-0))
+		
+	if detachmentModel == 'bl-sexp':
+	
+		if F <= 0:
+			L = L_h
+			delta = delta_h
+			return (1.0/((L*exp(-delta*abs(F)/kT)/step_length) + 1.0))
+
+		elif F > 2:
+			L = L_a
+			delta = delta_a
+			return (1.0/((L*exp(-delta*abs(F)/kT)/step_length) + 1.0))
+		
+		else:
+			A = 1.0/((L_h/step_length) + 1.0)
+			B = 1.0/((L_a*np.exp(-delta_a*2/kT)/step_length) + 1.0)
+			w = 0.1
+			gamma = w-A
+			tau = 2/np.log((w-B)/(w-A))
+			
+			return(w-gamma*np.e**(F/tau))
+
+	if detachmentModel == 'w':
+		if F <= 0:
+			return (   epsilon_0*exp(abs(F)/F_dminus)   )
+		elif F > 2:
+			return(   epsilon_0*7.4*exp(F/F_dplus))   
+		else: 
+			return(   epsilon_0*(1+3.8247*F)   )
+		
+	if detachmentModel == 'w-d':
+		if F <= 0:
+			return (   epsilon_0*exp(abs(F)/F_dminus)   )
+		elif F > 0:
+			return(   epsilon_0*7.4*exp(F/F_dplus))
+
+	if detachmentModel == 'w-sexp':
+		if F <= 0:
+			return (   epsilon_0*exp(abs(F)/F_dminus)   )
+		elif F > 2:
+			return(   epsilon_0*7.4*exp(F/F_dplus))
+		else:
+			A = epsilon_0
+			B = epsilon_0*7.4*exp(2/F_dplus)
+			w = 0.0055 # can be changed w=0.0055 gives tau ~ -1.0483237
+			gamma = w-A
+			tau = 2/np.log((w-B)/(w-A))
+			return(w-gamma*exp(F/tau))
+
+
+	if detachmentModel == 'sym':
+		
+		return ( step_length / L_h ) * exp( delta_h*abs(F) / kT )
+
+	if detachmentModel == 'k':
+
+		if F <= 0:
+			return zero_load_detachment_rate * exp( abs(F) / detachment_force )
+		if F > 0:
+			return 0
+
+	if detachmentModel == 'front-det':
+		if F <= 0:
+			L = L_h
+			delta = delta_h
+			return ( step_length / L ) * exp( delta*abs(F) / kT )
+
+		if F > 0:
+			return 0
+
+	if detachmentModel == 'nev-det':
+		return 0
+
+def stuckDetachment(F):
+	return zero_load_detachment_rate * exp( abs(F) / detachment_force )
+
+def k_step(F, *substate):
+
+	if superstall:
+		if -F > stall_force:
+			return 3E-3 
+
+	if forceVelocityModel == 'm':
+		k1, k2, k3, d1, d3, Fi = pMilic 
+		
+		return ( ( k1*exp(F*d1/kT) )**(-1) + ( k2 )**(-1) + ( k3*exp((F+Fi)*d3/kT) )**(-1) )**(-1)
+
+	if forceVelocityModel == 'bl':
+
+		def k_cat(F):
+			return k0 / (1 + q * ( exp( abs(F) * delta / kT ) - 1) )
+
+		if F <= 0:
+			return k_cat(F)
+
+		if F > 0:
+			return v / step_length
+
+	if forceVelocityModel == 'k':
+		if F <= 0:
+			return ( v / step_length ) * ( 1 - ( abs(F) / stall_force ) ** w )
+		if F > 0:
+			return v / step_length
+
+	if forceVelocityModel == 'a':
+
+		k1, k2, k3, d1, d3, Fi = pMilic 
+
+		if substate[0] == 1:		
+			return k1 * exp(F*d1/kT)
+		elif substate[0] ==2:		
+			return k2
+		elif substate[0] == 3:		
+			return k3 * exp((F+Fi)*d3/kT)
+		else:
+			raise ValueError('Substep not passed to k_step() or incorrect value passed.')
+	
+	if forceVelocityModel == 'w':
+		if F <= -F_stall:
+			return(0)
+		elif F <= 0: # if -F_stall < F <= 0
+			return (( v_0 / step_length ) * (1-(F/stall_force)**2))
+		if F > 0:
+			return (v_0 / step_length)
+
+def pseudo(aList, F):
+	aList = np.asfarray(aList)
+
+	def f(x, a):
+			if abs(x - a) < rest_length:
+					return 0
+			else:
+					return -neck_stiffness*(abs(x - a) - rest_length)*np.sign(x-a)
+
+	fv = np.vectorize(f)
+
+	posts = np.sort(np.hstack((aList + rest_length, aList - rest_length)))
+	minima = [ (p, F + np.sum(fv(p, a) for a in aList)) for p in posts]
+
+	justMin = np.asfarray([m for p,m in minima])
+
+	if np.all( justMin < 0) :
+			p, m  = minima[0]
+			#pos = p + m/(2*neck_stiffness)
+			pos = p + m/(neck_stiffness)
+
+	if np.all( justMin > 0):
+			p, m  = minima[-1]
+			#pos = p + m/(2*neck_stiffness)
+			pos = p + m/(neck_stiffness)
+
+	for (p1, m1), (p2, m2) in  zip(minima[:-1], minima[1:]):
+			if m1 > 0 and m2 < 0:
+					pos = (p1 - p2)/((m2/m1) - 1) + p1
+
+			if m1 == 0 and m2 == 0:
+					pos = (p1 + p2)/2
+
+	return pos
+
+class Trap:
+	"""Trap class is for simulating optical trap. For a constant load, it's easier to use the load parameter."""
+	def __init__(self, on = False):
+		self.position = 0.0
+		self.on = on
+		self.stiffness = trapStiffness
+
+	def update(self, bead, t):
+	# Update allows us to program a "schedule" for the trap 
+		pass			
+
+class Bead:
+	"""Bead"""
+
+	def __init__(self):
+		self.position = 0.0
+		self.F = 0.0
+
+	def update(self, trap, *motors, motorjuststepped = False):
+
+		self.F = -np.sum( motor.F for motor in motors if motor.attached == True ) + load
+
+		if motorjuststepped == True: 
+			self.position += step_length
+			print('cargo self.position += step_length')
+
+		if VERBOSE:
+			print ("Bead force = {} pN".format(self.F))
+
+		if trap.on:
+			self.F += trap.stiffness * ( trap.position - self.position )
+
+		if diffusionModel == "PSEUDO":
+			if [m.position for m in motors if m.attached]:
+				self.position = pseudo([m.position for m in motors if m.attached], load)
+
+		elif diffusionModel == "FULL":
+			thermalKick = r.randn()*sqrt(2*resistance*kT/dt)
+			if VERBOSE:
+				print ('Thermal kick = {}'.format(thermalKick))
+			self.position += ( (self.F + thermalKick) / resistance ) * dt 
+
+		else:
+			print ("There is no diffusion model called {}!".format(diffusionModel))
+		if VERBOSE:
+			print ("Bead position = {:3.0f} nm".format(self.position))
+
+class Motor:
+	"""Single molecular motor"""
+	
+	def __init__(self, name):
+		self.tail = r.uniform(-bead_radius, bead_radius)  
+		# self.tail = 0.0
+		self.position = r.uniform(self.tail - rest_length, self.tail + rest_length) 
+		self.head = self.position
+		self.attached = True
+		self.F = 0.0 
+		self.name = name #for writing outfiles
+		self.history = [] #stores history of events: column 0 -- time, column 1 -- new position, column 2 -- unicode code for event (a, d, s)
+
+		self.juststepped = False
+
+		if kinesinModel == 'a':
+			self.substep = 1 #stores substep state. Begins automatically at stepping gate
+
+	def update(self, bead, time):
+
+		self.juststepped = False
+
+
+		if not self.attached and r.rand() < on_rate*dt:
+			self.attached = True
+			if kinesinModel == 'a':
+				self.substep = 1
+			self.position = self.tail + bead.position + r.uniform(-rest_length, rest_length)
+			self.history.append([time] + [self.position] + [ord('a')])
+			return
+			
+		if self.attached:
+			 
+
+			extension =  abs(self.position - ( bead.position + self.tail )) 
+
+			if extension <= rest_length and extension >= -rest_length:
+				self.F = 0.0
+			elif bead.position + self.tail - self.position > 0: 		
+				self.F = neck_stiffness * ( extension - rest_length )
+			elif bead.position + self.tail - self.position < 0:			
+				self.F = neck_stiffness * (rest_length - extension)
+
+			if VERBOSE:
+				print ("Motor/Elastic Force = {} pN".format(self.F))
+
+			if superstall:
+				if -self.F > stall_force:
+					if r.rand() < detachment(self.F):
+						self.attached = False
+						self.position = 0.0
+						self.F = 0.0
+						self.history.append([time] + [self.position] + [ord('d')])
+						return
+
+					elif r.rand() < k_step(self.F) * dt:
+						self.position -= step_length
+						self.history.append([time] + [self.position] + [ord('b')])
+						return
+
+					return
+
+			if kinesinModel == 'bl': 
+
+				if r.rand() < k_step(self.F)*dt:
+				
+					if r.rand() < detachment(self.F):
+						self.attached = False 
+						self.position = 0.0
+						self.F = 0.0
+						self.history.append([time] + [self.position] + [ord('d')])
+						return
+					
+					else:
+						self.position += step_length
+						self.history.append([time] + [self.position] + [ord('s')])
+						return
+
+			elif kinesinModel == 'k': 
+				if r.rand() < detachment(self.F)*dt:
+					self.attached = False
+					self.position = 0.0
+					self.history.append([time] + [self.position] + [ord('d')])
+					return
+
+				#if not detached, check if stepped
+				#if stepped, update position
+				elif r.rand() < k_step(self.F)*dt:
+					self.position += step_length
+					self.history.append([time] + [self.position] + [ord('s')])
+					
+					if zero_drag == True: 
+						self.juststepped = True
+						print('motor self.juststepped = True')
+
+					if VERBOSE:
+						print ("Motor stepped +8nm\n")
+
+			elif kinesinModel == 'a':
+				if self.substep == 1:
+					if r.rand() < k_step(self.F, self.substep)*dt:
+						self.substep = 2
+
+				elif self.substep == 2:
+
+					if r.rand() < k_step(self.F, self.substep)*dt:
+					
+						if r.rand() < detachment(self.F):
+							self.attached = False
+							self.position = 0.0
+							self.substep = 1
+							self.history.append([time] + [self.position] + [ord('d')])
+
+						else:
+							self.position += step_length
+							self.substep = 3
+							self.history.append([time] + [self.position] + [ord('s')])
+
+				elif self.substep == 3:
+					if r.rand() < k_step(self.F, self.substep)*dt:
+						self.substep = 1
+
+			else:
+				print ("There is no kinesin model called {}!".format(kinesinModel))
+
+
+		if VERBOSE:
+			print ("Motor position = {:3.0f} nm".format(self.position))
+
+
+	def save_history(self, trialdir):
+		current_hist = np.array(self.history)
+		if not os.path.exists(os.path.join(savefolder, trialdir)): os.makedirs(os.path.join(savefolder, trialdir))
+		date = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+		filename = self.name + '_sim_{}_{}'.format(comment, date)
+		header = 'Time \t New Position \t Event \n (Event code: 97-attachment, 100-detachment, 115-step) \n Relative position of tail to bead: ' + str(self.tail) + '\n Beginning head position: ' + str(self.head)
+		np.savetxt(os.path.join(savefolder, trialdir, filename + '.txt'), current_hist, header=header, delimiter='\t')
+
+class StuckMotor(Motor):
+	def update(self, bead, time):
+		if not self.attached and r.rand() < on_rate*dt:
+			self.attached = True
+			self.position = self.tail + bead.position + r.uniform(-rest_length, rest_length)
+			self.history.append([time] + [self.position] + [ord('a')])
+			return
+			
+		if self.attached:
+
+			extension = abs( self.position - ( bead.position + self.tail ) )
+			if extension <= rest_length:
+				self.F = 0.0
+			if extension > rest_length:
+				self.F = neck_stiffness * np.sign( ( bead.position + self.tail ) - self.position ) * ( extension - rest_length )
+
+			if r.rand() < stuckDetachment(self.F)*dt:
+				self.attached = False
+				self.position = 0.0
+				self.F = 0.0
+				self.history.append([time] + [self.position] + [ord('d')])
+				return
+
+def run_sim(N, trialdir, stuckMotors = 0, t_max = 6E3):
+	raw_folder = savefolder 
+	if not os.path.exists(os.path.join( raw_folder, trialdir)): os.makedirs(os.path.join( raw_folder, trialdir))
+	date = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+	filename = 'sim_{}_{}'.format(comment, date,)
+	posfile = os.path.join( raw_folder, trialdir, filename + '.pos.txt' )
+	forcefile = os.path.join( raw_folder, trialdir, filename + '.f.txt' )
+
+	print ('dt = {} ms\nMotors = {}\nSimulation time = {} ms'.format(dt, N, t_max))
+	
+	if not (N or stuckMotors):
+		print ("Not simulating any motors!")
+		return
+
+	if diffusionModel == "FULL":
+
+		decay_time = resistance/( neck_stiffness ) # Characteristic relaxation time when pulled. 1/v
+		
+		print ('Decay time = {} ms'.format(decay_time))
+		
+		if decay_time < 5*dt:
+			print ('WARNING: Time segments are too coarse. decay_time must be much less than dt/5.')
+			return
+		
+		
+
+
+	bead = Bead() #Initialize bead
+	motorlist = [Motor('kinesin' + str(k_n)) for k_n in range(N)] #Initialize N motors
+	stucklist = [StuckMotor('stuck_kinesin' + str(_)) for _ in range(stuckMotors)] #M stuck motors	# pass name to each StuckMotor constructor?
+	motorlist = motorlist + stucklist
+	trap = Trap(on = trapOn)
+
+	for motor in motorlist:
+		motor.attached = True #Attach all motors immediately at the start
+	t = 0 #Time elapsed (ms)
+	s1 = 0 # index incremented every timestep so that when it reaches a multiple of 1000, the position
+	s2 = 0 # index incremented every 1000 timesteps (every h & f save event) to count how many entries
+
+	h = np.zeros([100, N+2]) # a list with 100 entries, each entry is a list with (N+2) zeroes 
+	f = np.zeros([100, N+2]) # a list with 100 entries, each entry is a list with (N+2) zeroes
+
+
+
+	while t < t_max:
+
+		if VERBOSE:
+			print ("t = {}".format(t))
+		for motor in motorlist:
+			motor.update(bead, t)
+
+		if zero_drag == True and np.any( [ motor.juststepped for motor in motorlist ] ):
+			bead.update(trap, *motorlist, motorjuststepped = True)
+
+		else:
+			bead.update(trap, *motorlist)
+
+
+
+			
+		if VERBOSE:
+			print("\n")
+
+		if not np.any( [ motor.attached for motor in motorlist ] ):
+			print ('All motors detached!')
+
+			h[s2, 0] = t # first one is time
+			h[s2, 1:N+1] = np.array([motor.position for motor in motorlist])
+			h[s2, -1] = bead.position # last one is position of bead
+
+			f[s2, 0] = t
+			f[s2, 1:N+1] = np.array([motor.F for motor in motorlist])
+			f[s2, -1] = bead.F # last one is force on bead
+
+			s2 += 1
+
+			break
+		
+
+		if s1%1000 == 0: # do this every 1000 timesteps (s1 gets incremented in every timestep)
+
+			h[s2, 0] = t # first one is time
+			h[s2, 1:N+1] = np.array([motor.position for motor in motorlist])
+			h[s2, -1] = bead.position # last one is position of bead
+
+			f[s2, 0] = t
+			f[s2, 1:N+1] = np.array([motor.F for motor in motorlist])
+			f[s2, -1] = bead.F # last one is force on bead
+
+			s2 += 1 # increment s2 for every save into the h & f arrays (no writing into file yet)
+
+		t += dt
+		s1 += 1
+		
+		if s2 == 100:
+			with open(posfile, 'ab') as pf:
+				np.savetxt(pf, h, delimiter='\t')
+			with open(forcefile, 'ab') as ff:
+				np.savetxt(ff, f, delimiter='\t')
+
+			s2 = 0
+			h = np.zeros([100, N+2])
+			f = np.zeros([100, N+2])
+
+
+	if t > t_max:
+		print("t_max reached before all kinesins detach")
+
+	h = h[~np.all(h==0, axis=1)]
+	f = f[~np.all(f==0, axis=1)]
+
+	with open(posfile, 'ab') as pf:
+		np.savetxt(pf, h, delimiter='\t') 
+	with open(forcefile, 'ab') as ff:
+		np.savetxt(ff, f, delimiter='\t')
+
+	for motor in motorlist:
+		motor.save_history(trialdir)
+	
+
+def main():
+	r.seed()
+	for n in [n_motors]:
+		for rep in range(200):
+			date = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+			trialdir = comment + '_n_{}_rep_{}_time_{}_{}'.format(n, rep, date, r.randint(low=0,high=100))
+			run_sim(n, trialdir, stuckMotors=0, t_max=1E6)
+
+if __name__ == '__main__':
+
+	
+	savefolder = str(sys.argv[1])
+	comment = str(sys.argv[2])
+	longComment = comment + ' using numpy PRNG'
+
+	forceVelocityModel = str(sys.argv[3])
+	if forceVelocityModel == 'a':
+		kinesinModel = 'a'		
+	elif forceVelocityModel == 'm':
+		kinesinModel = 'bl'
+	elif forceVelocityModel == 'w':
+		kinesinModel = 'k'
+
+
+	load = float(sys.argv[4]) 
+	print ('Load applied: ', load)
+	n_motors = int(sys.argv[5])
+	print ('Running simulation with ', n_motors, ' motors.')
+
+	rest_length = float(sys.argv[6])
+	print ('kinesin length: ', rest_length)
+	neck_stiffness = float(sys.argv[7])
+	print ('kinesin stiffness: ', neck_stiffness)
+	print ('Effective bead radius: ', bead_radius)
+	print('zero_drag = '+str(zero_drag))
+	print(type(zero_drag))
+	main()
+
+
+
